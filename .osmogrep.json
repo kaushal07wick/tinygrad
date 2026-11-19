@@ -1,1 +1,1 @@
-{"install":"python3 -m venv /tmp/og-venv && /tmp/og-venv/bin/pip install -q numpy==2.2.6","test":"DEV=CPU /tmp/og-venv/bin/python -m unittest test.runtime.test_jit test.runtime.test_symbolic_jit test.runtime.test_pickle"}
+{"install":"(python3 -m pip --version || curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --user --break-system-packages -q) && python3 -m pip install --user --break-system-packages -q numpy==2.2.6","test":"DEV=CPU python3 -m unittest test.runtime.test_jit test.runtime.test_symbolic_jit test.runtime.test_pickle"}
