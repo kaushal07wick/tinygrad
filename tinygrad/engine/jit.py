@@ -3,7 +3,7 @@ import functools
 from tinygrad.tensor import Tensor, all_tensors
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, pluralize, VIZ, disable_gc
 from tinygrad.device import Buffer, MultiBuffer
-from tinygrad.dtype import DType
+from tinygrad.dtype import DType, AddrSpace
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, Ops, rewrite_group, graph_rewrite
 from tinygrad.engine.realize import capturing, compile_linear, link_linear, run_linear
 from tinygrad.codegen.memory import memory_plan_rewrite, _collect_bufs
@@ -21,12 +21,14 @@ def prune_linear(linear:UOp, needed:set[UOp]) -> tuple[UOp, UOp]:
     else: onetime.append(si)
   return linear.replace(src=tuple(kept)), linear.replace(src=tuple(onetime))
 
+def _input_params(input_uops:list[UOp]) -> dict[UOp, UOp]: return {u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}
+
 @rewrite_group(lambda linear,held_bufs,input_uops,ret=(): f"JIT {pluralize('call', len(linear.src))}")
 def jit_lower(linear:UOp, held_bufs:set[UOp], input_uops:list[UOp]) -> UOp:
   if VIZ: graph_rewrite(linear, PatternMatcher([]), name="View captured linear")
 
   # parametrize input buffers: map each input buffer UOp to a PARAM with the correct slot index
-  linear = linear.substitute({u: UOp.param(i, u.dtype, u.max_numel(), u.device) for i,u in enumerate(input_uops)}, walk=True)
+  linear = linear.substitute(_input_params(input_uops), walk=True)
   # storage no one outside the jit holds is scratch: it's planned and bound at link
   scratch = {u: UOp.alloc((u.max_numel(),), u.dtype, device=u.device) for u in linear.toposort() if u.op is Ops.BUFFER and u not in held_bufs}
   linear = memory_plan_rewrite(linear.substitute(scratch, walk=True))
@@ -43,6 +45,18 @@ def _check_no_non_tensor_return(ret):
     return
   raise JitError(f"JIT return contains non-Tensor value of type {type(ret).__name__}")
 
+def _own_input_views(ret, input_uops:list[UOp]) -> tuple[Any, list[tuple[Tensor, UOp]]]:
+  # a returned Tensor that is (a view of) a jit input must follow each call's input. it's replaced by a jit-owned Tensor, so rebinding it
+  # never changes a Tensor the caller passed in, and its uop is kept as a template with the inputs as PARAMs
+  params, templates = _input_params(input_uops), []
+  def own(x):
+    if isinstance(x, (tuple, list)): return type(x)(*map(own, x)) if hasattr(x, "_fields") else type(x)(map(own, x))
+    if isinstance(x, dict): return type(x)({k:own(v) for k,v in x.items()})
+    if not isinstance(x, Tensor) or params.keys().isdisjoint(x.uop.toposort()): return x
+    templates.append((t:=Tensor(x.uop), x.uop.substitute(params, walk=True)))
+    return t
+  return own(ret), templates
+
 ReturnType = TypeVar('ReturnType')
 @dataclass
 class CapturedJit(Generic[ReturnType]):
@@ -51,16 +65,20 @@ class CapturedJit(Generic[ReturnType]):
   expected_names: list[int|str]
   expected_input_info: list[tuple[UOp, tuple[Variable, ...], DType, str]]  # (view, variables, dtype, device) per input
   var_vals: dict[str, int]  # the values of the Variables at capture, inputs are replaced every call
+  input_ret: list[tuple[Tensor, UOp]] = field(default_factory=list)  # returned Tensors that view inputs, with the inputs as PARAMs
   _linears: dict[tuple[UOp, ...], tuple[UOp, dict[UOp, UOp]]] = field(default_factory=dict)  # aliased inputs -> (linked linear with copies, staging)
 
-  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info, self.var_vals)
+  def __reduce__(self): return self.__class__, (self.ret, self._linear, self.expected_names, self.expected_input_info, self.var_vals, self.input_ret)
 
   @functools.cached_property
   def _jit_bufs(self) -> set[UOp]: return {u for u in self._linear.toposort() if u.op is Ops.BUFFER}
 
   @functools.cached_property
-  def _symbolic_ret(self) -> list[tuple[Tensor, UOp, dict[Variable, int]]]:
-    return [(t, *ub) for t in get_parameters(self.ret) if (ub:=t.uop.unbind_all())[1]]
+  def _rebound_ret(self) -> list[tuple[Tensor, UOp, dict[Variable, int], list[UOp]]]:
+    # returned Tensors rebuilt every call: (tensor, unbound template, capture var values, input PARAMs bound by slot like run_linear)
+    templates = {id(t):u for t,u in self.input_ret}
+    return [(t, *ub, [p for p in ub[0].toposort() if p.op is Ops.PARAM and p.addrspace is AddrSpace.GLOBAL]) for t in get_parameters(self.ret)
+            if (ub:=templates.get(id(t), t.uop).unbind_all())[1] or id(t) in templates]
 
   def __call__(self, input_uops:list[UOp], var_vals:dict[str, int]) -> ReturnType:
     # aliased inputs
@@ -72,8 +90,9 @@ class CapturedJit(Generic[ReturnType]):
 
     linear, staging = self._linears[aliased]
     if DEBUG >= 1 and len(linear.src) >= 10: print(f"jit execs {len(linear.src)} calls")
-    run_linear(linear, {**self.var_vals, **var_vals}, input_uops=[staging.get(u, u) for u in input_uops], jit=True)
-    for t,u,vals in self._symbolic_ret: t.uop = u.substitute({v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, walk=True)
+    run_linear(linear, {**self.var_vals, **var_vals}, input_uops=(bufs:=[staging.get(u, u) for u in input_uops]), jit=True)
+    for t,u,vals,params in self._rebound_ret:
+      t.uop = u.substitute({**{v:v.bind(var_vals.get(v.expr, i)) for v,i in vals.items()}, **{p:bufs[p.arg.slot] for p in params}}, walk=True)
     return self.ret
 
   def free_intermediates(self): self._linears.clear()
@@ -163,7 +182,8 @@ class _TinyJit(Generic[ReturnType]):
       # drop the pre-planning graph: it keeps the whole capture-time working set allocated (big_linear) or referenced (held_bufs).
       # the planned linear only uses the arena/held buffers, so the intermediates must be freed before linking and first exec
       del big_linear, held_bufs
-      self.captured = CapturedJit(ret, linear, names, expected_input_info, capture_var_vals)
+      ret, input_ret = _own_input_views(ret, input_buf_uops)
+      self.captured = CapturedJit(ret, linear, names, expected_input_info, capture_var_vals, input_ret)
       ret = self.captured(input_buf_uops, var_vals)
     elif self.cnt >= 2:
       # jit exec
