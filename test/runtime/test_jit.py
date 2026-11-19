@@ -23,6 +23,21 @@ class TestJit(unittest.TestCase):
       x = (Tensor.arange(10).float() + i * 10).clone().realize()
       np.testing.assert_allclose(f(x).numpy(), x.numpy()[2:5] + 1)
 
+  def test_jit_return_input(self):
+    @TinyJit
+    def f(a):
+      a.assign(a + 1)
+      return a, a[1:3]
+    inputs = []
+    for i in range(5):
+      a = Tensor([i * 10.0] * 4).contiguous().realize()
+      inputs.append(a)
+      ret, view = f(a)
+      np.testing.assert_equal(ret.numpy(), [i * 10 + 1] * 4)
+      np.testing.assert_equal(view.numpy(), [i * 10 + 1] * 2)
+    # returning an input must not rebind the tensors passed on earlier calls
+    for i, a in enumerate(inputs): np.testing.assert_equal(a.numpy(), [i * 10 + 1] * 4)
+
   @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, X86Renderer), "estimates are wrong for x86")
   def test_global_counters_jit(self):
     @TinyJit
